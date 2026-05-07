@@ -339,6 +339,13 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		if c != nil && c.Request != nil {
+			path := c.Request.URL.Path
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || path == "/management.html" {
+				c.Next()
+				return
+			}
+		}
 		client := home.Current()
 		if client == nil || !client.HeartbeatOK() {
 			c.AbortWithStatus(http.StatusServiceUnavailable)
@@ -683,6 +690,14 @@ func (s *Server) registerManagementRoutes() {
 
 func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if s == nil || s.cfg == nil {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+		if s.cfg.Home.Enabled {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
 		if !s.managementRoutesEnabled.Load() {
 			c.AbortWithStatus(http.StatusNotFound)
 			return
@@ -693,7 +708,7 @@ func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
 
 func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	cfg := s.cfg
-	if cfg == nil || cfg.RemoteManagement.DisableControlPanel {
+	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
