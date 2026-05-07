@@ -11,6 +11,13 @@ tls:
   cert: ""
   key: ""
 
+# Optional "home" control plane integration over Redis protocol.
+home:
+  enabled: false
+  host: "127.0.0.1"
+  port: 6379
+  password: ""
+
 # Management API settings
 remote-management:
   # Whether to allow remote (non-localhost) management access.

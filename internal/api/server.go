@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +30,7 @@ import (
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v7/internal/api/modules/amp"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
@@ -284,6 +287,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	s.localPassword = optionState.localPassword
 
+	// Home heartbeat gate: when home is enabled, block all endpoints with 503 until the
+	// subscribe-config heartbeat connection is healthy.
+	engine.Use(s.homeHeartbeatMiddleware())
+
 	// Setup routes
 	s.setupRoutes()
 
@@ -308,7 +315,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// or when a local management password is provided (e.g. TUI mode).
 	hasManagementSecret := cfg.RemoteManagement.SecretKey != "" || envManagementSecret || s.localPassword != ""
 	s.managementRoutesEnabled.Store(hasManagementSecret)
-	redisqueue.SetEnabled(hasManagementSecret)
+	redisqueue.SetEnabled(hasManagementSecret || (cfg != nil && cfg.Home.Enabled))
 	if hasManagementSecret {
 		s.registerManagementRoutes()
 	}
@@ -324,6 +331,21 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 
 	return s
+}
+
+func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s == nil || s.cfg == nil || !s.cfg.Home.Enabled {
+			c.Next()
+			return
+		}
+		client := home.Current()
+		if client == nil || !client.HeartbeatOK() {
+			c.AbortWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		c.Next()
+	}
 }
 
 // setupRoutes configures the API routes for the server.
@@ -783,6 +805,11 @@ func (s *Server) watchKeepAlive() {
 // otherwise it routes to OpenAI handler.
 func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, claudeHandler *claude.ClaudeCodeAPIHandler) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if s != nil && s.cfg != nil && s.cfg.Home.Enabled {
+			s.handleHomeModels(c)
+			return
+		}
+
 		userAgent := c.GetHeader("User-Agent")
 
 		// Route to Claude handler if User-Agent starts with "claude-cli"
@@ -794,6 +821,170 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 			openaiHandler.OpenAIModels(c)
 		}
 	}
+}
+
+type homeModelEntry struct {
+	id          string
+	created     int64
+	ownedBy     string
+	displayName string
+}
+
+func (s *Server) handleHomeModels(c *gin.Context) {
+	if s == nil || c == nil || c.Request == nil {
+		return
+	}
+	client := home.Current()
+	if client == nil {
+		c.JSON(http.StatusServiceUnavailable, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "home control center unavailable",
+				Type:    "server_error",
+			},
+		})
+		return
+	}
+
+	raw, errGet := client.GetModels(c.Request.Context())
+	if errGet != nil {
+		c.JSON(http.StatusBadGateway, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: errGet.Error(),
+				Type:    "server_error",
+			},
+		})
+		return
+	}
+
+	entries, errDecode := decodeHomeModels(raw)
+	if errDecode != nil {
+		c.JSON(http.StatusBadGateway, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: errDecode.Error(),
+				Type:    "server_error",
+			},
+		})
+		return
+	}
+
+	userAgent := c.GetHeader("User-Agent")
+	isClaude := strings.HasPrefix(userAgent, "claude-cli")
+
+	if isClaude {
+		out := make([]map[string]any, 0, len(entries))
+		for _, entry := range entries {
+			model := map[string]any{
+				"id":       entry.id,
+				"object":   "model",
+				"owned_by": entry.ownedBy,
+			}
+			if entry.created > 0 {
+				model["created_at"] = entry.created
+			}
+			if entry.displayName != "" {
+				model["display_name"] = entry.displayName
+			}
+			out = append(out, model)
+		}
+		firstID := ""
+		lastID := ""
+		if len(out) > 0 {
+			if id, ok := out[0]["id"].(string); ok {
+				firstID = id
+			}
+			if id, ok := out[len(out)-1]["id"].(string); ok {
+				lastID = id
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"data":     out,
+			"has_more": false,
+			"first_id": firstID,
+			"last_id":  lastID,
+		})
+		return
+	}
+
+	filtered := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		model := map[string]any{
+			"id":     entry.id,
+			"object": "model",
+		}
+		if entry.created > 0 {
+			model["created"] = entry.created
+		}
+		if entry.ownedBy != "" {
+			model["owned_by"] = entry.ownedBy
+		}
+		filtered = append(filtered, model)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"object": "list",
+		"data":   filtered,
+	})
+}
+
+func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("home models payload is empty")
+	}
+
+	var bySection map[string][]map[string]any
+	if err := json.Unmarshal(raw, &bySection); err != nil {
+		return nil, fmt.Errorf("parse home models payload: %w", err)
+	}
+	if len(bySection) == 0 {
+		return nil, fmt.Errorf("home models payload has no sections")
+	}
+
+	seen := make(map[string]struct{})
+	out := make([]homeModelEntry, 0, 256)
+	for _, models := range bySection {
+		for _, model := range models {
+			id, _ := model["id"].(string)
+			id = strings.TrimSpace(id)
+			if id == "" {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+
+			created := int64(0)
+			switch v := model["created"].(type) {
+			case float64:
+				created = int64(v)
+			case int64:
+				created = v
+			case int:
+				created = int64(v)
+			case json.Number:
+				if n, err := v.Int64(); err == nil {
+					created = n
+				}
+			}
+
+			ownedBy, _ := model["owned_by"].(string)
+			ownedBy = strings.TrimSpace(ownedBy)
+			displayName, _ := model["display_name"].(string)
+			displayName = strings.TrimSpace(displayName)
+
+			out = append(out, homeModelEntry{
+				id:          id,
+				created:     created,
+				ownedBy:     ownedBy,
+				displayName: displayName,
+			})
+		}
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
+	if len(out) == 0 {
+		return nil, fmt.Errorf("home models payload contains no models")
+	}
+	return out, nil
 }
 
 // Start begins listening for and serving HTTP or HTTPS requests.
@@ -1061,7 +1252,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 			s.managementRoutesEnabled.Store(!newSecretEmpty)
 		}
 	}
-	redisqueue.SetEnabled(s.managementRoutesEnabled.Load())
+	redisqueue.SetEnabled(s.managementRoutesEnabled.Load() || (cfg != nil && cfg.Home.Enabled))
 
 	s.applyAccessConfig(oldCfg, cfg)
 	s.cfg = cfg
