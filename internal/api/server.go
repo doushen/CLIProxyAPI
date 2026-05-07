@@ -1285,11 +1285,14 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	}
 
 	// Count client sources from configuration and auth store.
-	tokenStore := sdkAuth.GetTokenStore()
-	if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
-		dirSetter.SetBaseDir(cfg.AuthDir)
+	authEntries := 0
+	if cfg != nil && !cfg.Home.Enabled {
+		tokenStore := sdkAuth.GetTokenStore()
+		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
+			dirSetter.SetBaseDir(cfg.AuthDir)
+		}
+		authEntries = util.CountAuthFiles(context.Background(), tokenStore)
 	}
-	authEntries := util.CountAuthFiles(context.Background(), tokenStore)
 	geminiAPIKeyCount := len(cfg.GeminiKey)
 	claudeAPIKeyCount := len(cfg.ClaudeKey)
 	codexAPIKeyCount := len(cfg.CodexKey)
