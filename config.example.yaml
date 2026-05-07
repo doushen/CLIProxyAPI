@@ -74,6 +74,7 @@ error-logs-max-files: 10
 usage-statistics-enabled: false
 
 # How long (in seconds) Redis usage queue items are retained in memory for the RESP interface (LPOP/RPOP).
+# Note: the in-process Redis RESP usage output is disabled when home.enabled is true.
 # Default: 60. Max: 3600.
 redis-usage-queue-retention-seconds: 60
 
