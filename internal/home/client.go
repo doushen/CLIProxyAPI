@@ -20,6 +20,8 @@ const (
 	redisChannelConfig = "config"
 	redisKeyModels     = "models"
 	redisKeyUsage      = "usage"
+
+	homeReconnectInterval = time.Second
 )
 
 var (
@@ -290,44 +292,44 @@ func (c *Client) StartConfigSubscriber(ctx context.Context, onConfig func([]byte
 		c.Close()
 
 		if errEnsure := c.ensureClients(); errEnsure != nil {
-			log.Warn("unable to connect to home control center, retrying in 30 seconds")
-			sleepWithContext(ctx, 30*time.Second)
+			log.Warn("unable to connect to home control center, retrying in 1 second")
+			sleepWithContext(ctx, homeReconnectInterval)
 			continue
 		}
 
 		if errPing := c.Ping(ctx); errPing != nil {
-			log.Warn("unable to connect to home control center, retrying in 30 seconds")
-			sleepWithContext(ctx, 30*time.Second)
+			log.Warn("unable to connect to home control center, retrying in 1 second")
+			sleepWithContext(ctx, homeReconnectInterval)
 			continue
 		}
 
 		raw, errGet := c.GetConfig(ctx)
 		if errGet != nil {
-			log.Warn("unable to fetch config from home control center, retrying in 30 seconds")
-			sleepWithContext(ctx, 30*time.Second)
+			log.Warn("unable to fetch config from home control center, retrying in 1 second")
+			sleepWithContext(ctx, homeReconnectInterval)
 			continue
 		}
 		if errApply := onConfig(raw); errApply != nil {
-			log.Warn("unable to apply config from home control center, retrying in 30 seconds")
-			sleepWithContext(ctx, 30*time.Second)
+			log.Warn("unable to apply config from home control center, retrying in 1 second")
+			sleepWithContext(ctx, homeReconnectInterval)
 			continue
 		}
 
 		if c.sub == nil {
-			sleepWithContext(ctx, 30*time.Second)
+			sleepWithContext(ctx, homeReconnectInterval)
 			continue
 		}
 
 		pubsub := c.sub.Subscribe(ctx, redisChannelConfig)
 		if pubsub == nil {
-			sleepWithContext(ctx, 30*time.Second)
+			sleepWithContext(ctx, homeReconnectInterval)
 			continue
 		}
 
 		// Ensure the subscription is established before marking heartbeat OK.
 		if _, errReceive := pubsub.Receive(ctx); errReceive != nil {
 			_ = pubsub.Close()
-			sleepWithContext(ctx, 30*time.Second)
+			sleepWithContext(ctx, homeReconnectInterval)
 			continue
 		}
 
@@ -338,6 +340,7 @@ func (c *Client) StartConfigSubscriber(ctx context.Context, onConfig func([]byte
 			if errMsg != nil {
 				_ = pubsub.Close()
 				c.heartbeatOK.Store(false)
+				sleepWithContext(ctx, homeReconnectInterval)
 				break
 			}
 			if msg == nil {
